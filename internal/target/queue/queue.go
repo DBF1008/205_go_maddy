@@ -927,6 +927,16 @@ func (q *Queue) openMessage(id string) (*QueueMetadata, textproto.Header, buffer
 		}
 		return nil, textproto.Header{}, nil, err
 	}
+	// textproto.ReadHeader copies the header into memory, so the file handle is
+	// no longer needed once openMessage returns. Closing it via defer releases
+	// the descriptor on every exit path - success, parse error, or panic
+	// unwinding - which otherwise leaks one fd on every queue read (retries and
+	// start-up recovery call this frequently).
+	defer func() {
+		if err := headerFile.Close(); err != nil {
+			q.log.Error("header file close failed", err)
+		}
+	}()
 
 	bufferedHeader := bufio.NewReader(headerFile)
 	header, err := textproto.ReadHeader(bufferedHeader)

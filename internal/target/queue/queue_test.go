@@ -28,6 +28,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"testing"
 	"time"
@@ -823,6 +825,87 @@ func TestQueueDSN_RcptRewrite(t *testing.T) {
 	if !bytes.Contains(msg.Body, []byte("test+public@example.com")) || !bytes.Contains(msg.Body, []byte("test2+public@example.com")) {
 		t.Errorf("DSN contents do not mention original addresses")
 	}
+}
+
+// TestQueueOpenMessage_NoHeaderFDLeak is a regression test for a file
+// descriptor leak in openMessage. It used to open ID.header with os.Open but
+// never close the returned *os.File, leaking one fd on every read. openMessage
+// runs on every retry and during start-up recovery, so under high retry rates
+// or large backlogs this exhausted the process fd table, which in turn broke
+// queue file clean-up and message recovery.
+//
+// The test reads the same stored message many times and asserts that the number
+// of open file descriptors does not grow. GC is disabled for the measurement so
+// the *os.File finalizer (which would otherwise close leaked fds
+// non-deterministically) cannot mask the leak.
+func TestQueueOpenMessage_NoHeaderFDLeak(t *testing.T) {
+	// /proc/self/fd based accounting is Linux-specific.
+	if runtime.GOOS != "linux" {
+		t.Skip("fd accounting via /proc/self/fd is only available on Linux")
+	}
+	// Intentionally NOT t.Parallel(): non-parallel tests run alone in Go's
+	// sequential phase, so no other queue test perturbs the fd count while we
+	// measure it.
+
+	dt := unreliableTarget{}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	// Store a message directly so it stays on disk for repeated reads without
+	// involving the delivery machinery (which would remove it once delivered).
+	const id = "fdleakregression"
+	meta := &QueueMetadata{
+		MsgMeta:      &module.MsgMetadata{ID: id, DontTraceSender: true},
+		From:         "sender@example.org",
+		To:           []string{"rcpt@example.org"},
+		RcptErrs:     map[string]*smtp.SMTPError{},
+		FirstAttempt: time.Now(),
+		LastAttempt:  time.Now(),
+	}
+	hdr := textproto.Header{}
+	hdr.Add("Subject", "fd leak regression")
+	body := buffer.MemoryBuffer{Slice: []byte("foobar\r\n")}
+	if _, err := q.storeNewMessage(meta, hdr, body); err != nil {
+		t.Fatalf("storeNewMessage: %v", err)
+	}
+
+	// One warm-up read so any one-time lazy allocations settle before counting.
+	if _, _, _, err := q.openMessage(id); err != nil {
+		t.Fatalf("openMessage warm-up: %v", err)
+	}
+
+	// Disable GC for the measurement window so leaked *os.File objects are not
+	// reclaimed (and their fds closed) by the finalizer mid-test. With the bug
+	// present this makes the leak deterministic; with the fix it is harmless
+	// because openMessage closes the file itself.
+	defer debug.SetGCPercent(debug.SetGCPercent(-1))
+
+	before := openFDCount(t)
+
+	const iterations = 64
+	for i := 0; i < iterations; i++ {
+		if _, _, _, err := q.openMessage(id); err != nil {
+			t.Fatalf("openMessage iteration %d: %v", i, err)
+		}
+	}
+
+	after := openFDCount(t)
+
+	if after > before {
+		t.Fatalf("openMessage leaked file descriptors: %d open before, %d after %d calls (delta %d)",
+			before, after, iterations, after-before)
+	}
+}
+
+// openFDCount returns the number of file descriptors currently open by the
+// process, as reported by the Linux /proc filesystem.
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Fatalf("read /proc/self/fd: %v", err)
+	}
+	return len(entries)
 }
 
 func init() {
