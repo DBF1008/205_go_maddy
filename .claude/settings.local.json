@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(\"/mnt/c/Program Files/Go/bin/go.exe\" test -v -run \"TestQueueDelivery$|TestQueueDSN$|TestQueueDSN_RcptRewrite|TestQueueDelivery_AbortIfNoRecipients|TestQueueDelivery_AbortNoDangling|TestTimeWheel|TestOpenMessage\" ./internal/target/queue/)"
+    ]
+  }
+}

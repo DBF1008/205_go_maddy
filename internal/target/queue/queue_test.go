@@ -23,11 +23,14 @@ import (
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -822,6 +825,201 @@ func TestQueueDSN_RcptRewrite(t *testing.T) {
 	}
 	if !bytes.Contains(msg.Body, []byte("test+public@example.com")) || !bytes.Contains(msg.Body, []byte("test2+public@example.com")) {
 		t.Errorf("DSN contents do not mention original addresses")
+	}
+}
+
+// writeTestMessageToDisk creates a complete queue message on disk (meta, header, body files).
+func writeTestMessageToDisk(t *testing.T, q *Queue, id string) {
+	t.Helper()
+
+	meta := &QueueMetadata{
+		MsgMeta: &module.MsgMetadata{
+			ID:              id,
+			DontTraceSender: true,
+		},
+		From:         "sender@example.com",
+		To:           []string{"rcpt@example.com"},
+		RcptErrs:     map[string]*smtp.SMTPError{},
+		TriesCount:   map[string]int{},
+		FirstAttempt: time.Now(),
+		LastAttempt:  time.Now(),
+	}
+
+	// Write meta
+	metaPath := filepath.Join(q.location, id+".meta")
+	metaFile, err := os.Create(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(metaFile).Encode(meta); err != nil {
+		metaFile.Close()
+		t.Fatal(err)
+	}
+	metaFile.Close()
+
+	// Write header with a proper terminating CRLF blank line.
+	headerPath := filepath.Join(q.location, id+".header")
+	if err := os.WriteFile(headerPath, []byte("From: sender@example.com\r\nTo: rcpt@example.com\r\nSubject: test\r\n\r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Write body
+	bodyPath := filepath.Join(q.location, id+".body")
+	if err := os.WriteFile(bodyPath, []byte("test body\r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countOpenFDs returns the number of open file descriptors for the current process.
+// It is only supported on Linux; on other platforms it returns -1.
+func countOpenFDs() int {
+	if runtime.GOOS != "linux" {
+		return -1
+	}
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return -1
+	}
+	return len(entries)
+}
+
+// TestOpenMessage_HeaderFileClosed is a regression test for the header file
+// descriptor leak in openMessage. Previously, os.Open("*.header") was never
+// followed by Close, causing one fd leak per call. This test calls
+// openMessage repeatedly and verifies that the process fd count does not grow.
+func TestOpenMessage_HeaderFileClosed(t *testing.T) {
+	t.Parallel()
+
+	dt := &unreliableTarget{}
+	q := newTestQueue(t, dt)
+	defer cleanQueue(t, q)
+
+	// Write several messages on disk so we have something to open.
+	msgIDs := make([]string, 5)
+	for i := range msgIDs {
+		id := fmt.Sprintf("test-fd-leak-msg-%d", i)
+		msgIDs[i] = id
+		writeTestMessageToDisk(t, q, id)
+	}
+
+	// Warm up: call openMessage once so any one-time runtime allocations
+	// (e.g. bufio reader pools) do not skew the fd baseline.
+	if _, _, _, err := q.openMessage(msgIDs[0]); err != nil {
+		t.Fatalf("warm-up openMessage: %v", err)
+	}
+
+	// Force GC so any finalizers for transient objects have run.
+	runtime.GC()
+
+	fdBefore := countOpenFDs()
+	if fdBefore < 0 {
+		t.Skip("cannot count open FDs on this platform")
+	}
+
+	// Call openMessage many times across different messages.
+	// With the bug present each call leaks one fd.
+	const rounds = 50
+	for r := 0; r < rounds; r++ {
+		for _, id := range msgIDs {
+			meta, hdr, body, err := q.openMessage(id)
+			if err != nil {
+				t.Fatalf("openMessage(%s) round %d: %v", id, r, err)
+			}
+			if meta == nil {
+				t.Fatalf("openMessage(%s) returned nil meta", id)
+			}
+			if body == nil {
+				t.Fatalf("openMessage(%s) returned nil body", id)
+			}
+			// Verify header was actually parsed so we know the
+			// read path was fully exercised.
+			if hdr.Get("From") == "" {
+				t.Fatalf("openMessage(%s): From header missing", id)
+			}
+		}
+	}
+
+	runtime.GC()
+	fdAfter := countOpenFDs()
+
+	// Allow a small margin for runtime-internal fd churn (epoll, timerfd,
+	// etc.), but the leak would add rounds*len(msgIDs) = 250 fds which is
+	// unmistakable.
+	const maxAcceptableGrowth = 10
+	if growth := fdAfter - fdBefore; growth > maxAcceptableGrowth {
+		t.Errorf("fd leak detected: %d fds opened during test (before=%d, after=%d); expected <= %d growth",
+			growth, fdBefore, fdAfter, maxAcceptableGrowth)
+	}
+}
+
+// TestOpenMessage_HeaderFileClosed_ErrorPath verifies that the header file
+// descriptor is also closed when textproto.ReadHeader fails (e.g. malformed
+// header content).
+func TestOpenMessage_HeaderFileClosed_ErrorPath(t *testing.T) {
+	t.Parallel()
+
+	dt := &unreliableTarget{}
+	q := newTestQueue(t, dt)
+	defer cleanQueue(t, q)
+
+	id := "test-fd-leak-bad-header"
+
+	// Write valid meta and body but a malformed header (no terminating
+	// blank line, invalid format) so ReadHeader returns an error.
+	meta := &QueueMetadata{
+		MsgMeta: &module.MsgMetadata{
+			ID:              id,
+			DontTraceSender: true,
+		},
+		From:         "sender@example.com",
+		To:           []string{"rcpt@example.com"},
+		RcptErrs:     map[string]*smtp.SMTPError{},
+		TriesCount:   map[string]int{},
+		FirstAttempt: time.Now(),
+		LastAttempt:  time.Now(),
+	}
+	metaPath := filepath.Join(q.location, id+".meta")
+	metaFile, err := os.Create(metaPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.NewEncoder(metaFile).Encode(meta); err != nil {
+		metaFile.Close()
+		t.Fatal(err)
+	}
+	metaFile.Close()
+
+	// Completely invalid header: binary garbage with no CRLF line endings.
+	headerPath := filepath.Join(q.location, id+".header")
+	if err := os.WriteFile(headerPath, []byte{0x00, 0x01, 0x02, 0x03}, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	bodyPath := filepath.Join(q.location, id+".body")
+	if err := os.WriteFile(bodyPath, []byte("body\r\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.GC()
+	fdBefore := countOpenFDs()
+	if fdBefore < 0 {
+		t.Skip("cannot count open FDs on this platform")
+	}
+
+	// Each call should fail in ReadHeader but must still close the header fd.
+	const rounds = 50
+	for i := 0; i < rounds; i++ {
+		// We expect an error here due to malformed header.
+		q.openMessage(id)
+	}
+
+	runtime.GC()
+	fdAfter := countOpenFDs()
+
+	const maxAcceptableGrowth = 10
+	if growth := fdAfter - fdBefore; growth > maxAcceptableGrowth {
+		t.Errorf("fd leak on error path: %d fds opened during test (before=%d, after=%d); expected <= %d growth",
+			growth, fdBefore, fdAfter, maxAcceptableGrowth)
 	}
 }
 

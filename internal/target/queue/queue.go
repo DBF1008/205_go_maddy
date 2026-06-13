@@ -927,6 +927,11 @@ func (q *Queue) openMessage(id string) (*QueueMetadata, textproto.Header, buffer
 		}
 		return nil, textproto.Header{}, nil, err
 	}
+	defer func() {
+		if err := headerFile.Close(); err != nil {
+			q.log.Error("header file close failed", err)
+		}
+	}()
 
 	bufferedHeader := bufio.NewReader(headerFile)
 	header, err := textproto.ReadHeader(bufferedHeader)
