@@ -198,6 +198,7 @@ func readFile(path string, out map[string][]string) error {
 	if err != nil {
 		return err
 	}
+	defer f.Close()
 
 	scnr := bufio.NewScanner(f)
 	lineCounter := 0

@@ -275,6 +275,60 @@ func TestFileReload_Removed(t *testing.T) {
 	}
 }
 
+// TestReadFile_NoFDLeak is a regression test for the file descriptor leak in
+// readFile(). It calls readFile() many times and verifies that file
+// descriptors are not leaked (on Linux via /proc/self/fd, on other platforms
+// by relying on the typical 1024 fd ulimit).
+func TestReadFile_NoFDLeak(t *testing.T) {
+	f, err := os.CreateTemp("", "maddy-tests-fdleak-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	name := f.Name()
+	defer os.Remove(name)
+	if _, err := f.WriteString("a: b"); err != nil {
+		f.Close()
+		t.Fatal(err)
+	}
+	f.Close()
+
+	const iterations = 2000
+
+	// Snapshot open fd count before the loop (Linux-specific, best-effort
+	// on other platforms).
+	countOpenFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return -1 // unavailable, skip fd-count check
+		}
+		return len(entries)
+	}
+
+	before := countOpenFDs()
+
+	for i := 0; i < iterations; i++ {
+		out := map[string][]string{}
+		if err := readFile(name, out); err != nil {
+			t.Fatalf("readFile iteration %d failed: %v (possible fd leak)", i, err)
+		}
+		if out["a"] == nil || out["a"][0] != "b" {
+			t.Fatalf("readFile iteration %d returned wrong data: %v", i, out)
+		}
+	}
+
+	after := countOpenFDs()
+
+	if before >= 0 && after >= 0 {
+		// Allow a small delta for unrelated runtime activity, but the
+		// growth must be nowhere near `iterations`.
+		growth := after - before
+		if growth > 10 {
+			t.Errorf("fd count grew by %d after %d readFile calls (before=%d, after=%d) — likely fd leak",
+				growth, iterations, before, after)
+		}
+	}
+}
+
 func init() {
 	reloadInterval = 10 * time.Millisecond
 }
