@@ -465,6 +465,7 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 	rollbackReload := func() {
 		// Restore DefaultLogger config that might be set by moduleConfig
 		log.DefaultLogger.Out = oldContainer.DefaultLogger.Out
+		container.Global = oldContainer
 	}
 
 	oldContainer.DefaultLogger.Msg("loading new configuration...")
@@ -472,6 +473,8 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 	if err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to load new configuration", err)
+		systemdStatusErr(err)
+		systemdStatus(SDReady, "Configuration running.")
 
 		return oldContainer
 	}
@@ -486,6 +489,8 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 	if err := oldContainer.Lifetime.EarlyStopAll(); err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to early-stop old server", err)
+		systemdStatusErr(err)
+		systemdStatus(SDReady, "Configuration running.")
 
 		return oldContainer
 	}
@@ -495,6 +500,8 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 	if err := moduleStart(newContainer); err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to start new server", err)
+		systemdStatusErr(err)
+		systemdStatus(SDReady, "Configuration running.")
 
 		return oldContainer
 	}

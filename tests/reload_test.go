@@ -23,6 +23,8 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package tests_test
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -252,4 +254,210 @@ func TestImapStorageSwitch(tt *testing.T) {
 	imapConn2.Expect(")")
 	imapConn2.ExpectPattern(`. OK *`)
 
+}
+
+// writeConfigFile writes cfg to the config file used by the running server
+// without triggering a reload.  This is needed for tests that want to send
+// SIGUSR2 manually (e.g. to test reload failure paths where reloadedChan
+// would never fire).
+func writeConfigFile(t *tests.T, cfg string) {
+	t.Helper()
+
+	// The state/runtime directory preamble must match what tests.T.Config()
+	// generates so the running server can locate its directories.
+	configPreamble := "state_dir " + filepath.Join(t.StateDir()) + "\n" +
+		"runtime_dir " + filepath.Join(t.StateDir()) + "\n\n"
+
+	err := os.WriteFile(filepath.Join(t.StateDir(), "..", "maddy.conf"), []byte(configPreamble+cfg), os.ModePerm)
+	if err != nil {
+		t.Fatal("failed to write config file:", err)
+	}
+}
+
+// TestReloadFailureUnknownModule verifies that when a reload fails because the
+// new configuration references an unknown module, the server rolls back to the
+// old configuration and keeps serving connections.
+func TestReloadFailureUnknownModule(tt *testing.T) {
+	tt.Parallel()
+	t := tests.NewT(tt)
+
+	t.DNS(nil)
+	t.Port("smtp")
+	t.Config(`
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname maddy.test
+			tls off
+
+			reject
+		}
+	`)
+	t.Run(1)
+	defer t.Close()
+
+	// Verify initial config is working.
+	conn1 := t.Conn("smtp")
+	defer conn1.Close()
+	conn1.SMTPNegotation("localhost", nil, nil)
+	conn1.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn1.ExpectPattern("2*")
+	conn1.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn1.ExpectPattern("5*") // REJECTED
+	conn1.Writeln("RSET")
+	conn1.ExpectPattern("2*")
+
+	// Write a broken config that references a non-existent module and
+	// trigger a reload manually (reloadConfig would block forever because
+	// the "new server started" log line is never emitted on failure).
+	writeConfigFile(t, `
+		totally_fake_module_xyz {
+			something
+		}
+
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname maddy.test
+			tls off
+			reject
+		}
+	`)
+	t.ReloadSignal()
+	t.WaitReloadDone()
+
+	// The old server must still be running and responsive: open a fresh
+	// connection and verify the original reject behaviour is preserved.
+	conn2 := t.Conn("smtp")
+	defer conn2.Close()
+	conn2.SMTPNegotation("localhost", nil, nil)
+	conn2.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn2.ExpectPattern("2*")
+	conn2.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn2.ExpectPattern("5*") // Still REJECTED (running on old server)
+	conn2.Writeln("RSET")
+	conn2.ExpectPattern("2*")
+}
+
+// TestReloadFailureNoEndpoints verifies that when a reload fails because the
+// new configuration does not define any endpoints, the server rolls back to
+// the old configuration and keeps serving connections.
+func TestReloadFailureNoEndpoints(tt *testing.T) {
+	tt.Parallel()
+	t := tests.NewT(tt)
+
+	t.DNS(nil)
+	t.Port("smtp")
+	t.Config(`
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname maddy.test
+			tls off
+
+			reject
+		}
+	`)
+	t.Run(1)
+	defer t.Close()
+
+	// Verify initial config is working.
+	conn1 := t.Conn("smtp")
+	defer conn1.Close()
+	conn1.SMTPNegotation("localhost", nil, nil)
+	conn1.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn1.ExpectPattern("2*")
+	conn1.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn1.ExpectPattern("5*") // REJECTED
+	conn1.Writeln("RSET")
+	conn1.ExpectPattern("2*")
+
+	// Write a config that parses fine but has no endpoint blocks and
+	// trigger a reload manually.
+	writeConfigFile(t, `
+		hostname maddy.test
+	`)
+	t.ReloadSignal()
+	t.WaitReloadDone()
+
+	// The old server must still be running and responsive.
+	conn2 := t.Conn("smtp")
+	defer conn2.Close()
+	conn2.SMTPNegotation("localhost", nil, nil)
+	conn2.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn2.ExpectPattern("2*")
+	conn2.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn2.ExpectPattern("5*") // Still REJECTED (running on old server)
+	conn2.Writeln("RSET")
+	conn2.ExpectPattern("2*")
+}
+
+// TestReloadFailureModuleStart verifies that when a reload fails during
+// module startup (moduleStart returns an error), the server rolls back to
+// the old configuration and keeps serving connections.
+//
+// The failure is triggered by configuring an imapsql storage with a DSN
+// that points inside a regular file (not a directory), which makes SQLite
+// unable to create the database file during Start().
+func TestReloadFailureModuleStart(tt *testing.T) {
+	if !sqliteprovider.IsTranspiled {
+		tt.Skip("Test is unstable with original SQLite")
+	}
+
+	tt.Parallel()
+	t := tests.NewT(tt)
+
+	t.DNS(nil)
+	t.Port("smtp")
+	t.Config(`
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname maddy.test
+			tls off
+
+			reject
+		}
+	`)
+	t.Run(1)
+	defer t.Close()
+
+	// Verify initial config is working.
+	conn1 := t.Conn("smtp")
+	defer conn1.Close()
+	conn1.SMTPNegotation("localhost", nil, nil)
+	conn1.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn1.ExpectPattern("2*")
+	conn1.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn1.ExpectPattern("5*") // REJECTED
+	conn1.Writeln("RSET")
+	conn1.ExpectPattern("2*")
+
+	// Create a regular file that will block SQLite from creating a
+	// database at a path underneath it.  If the DSN is
+	// "<blocker>/imapsql.db", SQLite needs to create <blocker> as a
+	// directory but cannot because a regular file already exists there.
+	blocker := filepath.Join(t.StateDir(), "blocker")
+	if err := os.WriteFile(blocker, []byte("block"), 0o644); err != nil {
+		t.Fatal("failed to create blocker file:", err)
+	}
+
+	writeConfigFile(t, `
+		storage.imapsql test_store {
+			driver sqlite3
+			dsn `+blocker+`/imapsql.db
+		}
+
+		smtp tcp://127.0.0.1:{env:TEST_PORT_smtp} {
+			hostname maddy.test
+			tls off
+
+			deliver_to &test_store
+		}
+	`)
+	t.ReloadSignal()
+	t.WaitReloadDone()
+
+	// The old server must still be running and responsive.
+	conn2 := t.Conn("smtp")
+	defer conn2.Close()
+	conn2.SMTPNegotation("localhost", nil, nil)
+	conn2.Writeln("MAIL FROM:<sender@maddy.test>")
+	conn2.ExpectPattern("2*")
+	conn2.Writeln("RCPT TO:<testusr@maddy.test>")
+	conn2.ExpectPattern("5*") // Still REJECTED (running on old server)
+	conn2.Writeln("RSET")
+	conn2.ExpectPattern("2*")
 }

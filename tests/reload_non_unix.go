@@ -23,3 +23,11 @@ package tests
 func (t *T) reloadConfig() {
 	t.Skip("Tests for config reload are not available")
 }
+
+func (t *T) ReloadSignal() {
+	t.Skip("Tests for config reload are not available")
+}
+
+func (t *T) WaitReloadDone() {
+	t.Skip("Tests for config reload are not available")
+}
