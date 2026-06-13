@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(apt list:*)",
+      "Bash(dpkg -l)",
+      "Read(//usr/lib/**)",
+      "Read(//snap/go/current/bin/**)"
+    ]
+  }
+}

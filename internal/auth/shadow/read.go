@@ -32,12 +32,18 @@ var (
 	ErrWrongPassword = errors.New("shadow: wrong password")
 )
 
+// shadowPath is the path to the shadow password database file.
+// It is a variable so tests can override it.
+var shadowPath = "/etc/shadow"
+
 // Read reads system shadow passwords database and returns all entires in it.
 func Read() ([]Entry, error) {
-	f, err := os.Open("/etc/shadow")
+	f, err := os.Open(shadowPath)
 	if err != nil {
 		return nil, err
 	}
+	defer f.Close()
+
 	scnr := bufio.NewScanner(f)
 
 	var res []Entry
