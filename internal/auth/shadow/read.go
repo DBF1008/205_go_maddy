@@ -32,12 +32,21 @@ var (
 	ErrWrongPassword = errors.New("shadow: wrong password")
 )
 
+// shadowDBPath is the location of the system shadow password database. It is a
+// package variable rather than a constant so tests can point Read at a fixture
+// file (the real /etc/shadow cannot be safely created or read in tests).
+var shadowDBPath = "/etc/shadow"
+
 // Read reads system shadow passwords database and returns all entires in it.
 func Read() ([]Entry, error) {
-	f, err := os.Open("/etc/shadow")
+	f, err := os.Open(shadowDBPath)
 	if err != nil {
 		return nil, err
 	}
+	// Close the file on every return path (success, parse error and scanner
+	// error) so repeated calls via Lookup/AuthPlain do not leak descriptors.
+	defer f.Close()
+
 	scnr := bufio.NewScanner(f)
 
 	var res []Entry
