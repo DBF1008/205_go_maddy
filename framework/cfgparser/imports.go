@@ -97,6 +97,7 @@ func (ctx *parseContext) resolveImport(node Node, name string, expansionDepth in
 			return nil, err
 		}
 	}
+	defer src.Close()
 	nodes, snips, macros, err := readTree(src, file, expansionDepth+1)
 	if err != nil {
 		return nodes, err
