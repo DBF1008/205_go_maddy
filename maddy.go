@@ -458,17 +458,33 @@ func moduleMain(configPath string) error {
 	return nil
 }
 
+// Indirection points for the fallible steps and status notifications
+// performed during a configuration reload. They default to the real
+// implementations and exist so the reload failure handling -- which must
+// restore the systemd status to "ready" whenever the old configuration keeps
+// running -- can be exercised by unit tests.
+var (
+	reloadConfigure     = moduleConfigure
+	reloadEarlyStop     = func(c *container.C) error { return c.Lifetime.EarlyStopAll() }
+	reloadStart         = moduleStart
+	reloadSystemdStatus = systemdStatus
+)
+
 func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *sync.WaitGroup) *container.C {
 	oldContainer.DefaultLogger.Msg("reloading server...")
-	systemdStatus(SDReloading, "Reloading server...")
+	reloadSystemdStatus(SDReloading, "Reloading server...")
 
 	rollbackReload := func() {
-		// Restore DefaultLogger config that might be set by moduleConfig
+		// Restore DefaultLogger config that might be set by moduleConfigure.
 		log.DefaultLogger.Out = oldContainer.DefaultLogger.Out
+		// The old configuration keeps serving requests, so tell systemd the
+		// service is ready again instead of leaving it stuck in the reloading
+		// state (which would trip the watchdog and confuse operators).
+		reloadSystemdStatus(SDReady, "Configuration running.")
 	}
 
 	oldContainer.DefaultLogger.Msg("loading new configuration...")
-	newContainer, err := moduleConfigure(configPath)
+	newContainer, err := reloadConfigure(configPath)
 	if err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to load new configuration", err)
@@ -478,12 +494,16 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 
 	oldContainer.DefaultLogger.Msg("configuration loaded")
 	rollbackReload = func() {
-		// Restore DefaultLogger config that might be set by moduleConfig
+		// Restore DefaultLogger config that might be set by moduleConfigure.
 		log.DefaultLogger.Out = oldContainer.DefaultLogger.Out
 		container.Global = oldContainer
+		// The old configuration keeps serving requests, so tell systemd the
+		// service is ready again instead of leaving it stuck in the reloading
+		// state (which would trip the watchdog and confuse operators).
+		reloadSystemdStatus(SDReady, "Configuration running.")
 	}
 
-	if err := oldContainer.Lifetime.EarlyStopAll(); err != nil {
+	if err := reloadEarlyStop(oldContainer); err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to early-stop old server", err)
 
@@ -492,7 +512,7 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 
 	netresource.ResetListenersUsage()
 	oldContainer.DefaultLogger.Msg("starting new server")
-	if err := moduleStart(newContainer); err != nil {
+	if err := reloadStart(newContainer); err != nil {
 		rollbackReload()
 		oldContainer.DefaultLogger.Error("failed to start new server", err)
 
@@ -501,7 +521,7 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 
 	newContainer.DefaultLogger.Msg("new server started", "version", Version)
 
-	systemdStatus(SDReloading, "New configuration running. Waiting for old connections and transactions to finish...")
+	reloadSystemdStatus(SDReloading, "New configuration running. Waiting for old connections and transactions to finish...")
 
 	asyncStopWg.Add(1)
 	go func() {
@@ -521,7 +541,7 @@ func moduleReload(oldContainer *container.C, configPath string, asyncStopWg *syn
 			newContainer.DefaultLogger.Error("failed to close old server log", err)
 		}
 
-		systemdStatus(SDReady, "Configuration running.")
+		reloadSystemdStatus(SDReady, "Configuration running.")
 	}()
 
 	return newContainer
