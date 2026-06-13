@@ -193,11 +193,20 @@ func (f *File) reload() {
 	f.mLck.Unlock()
 }
 
-func readFile(path string, out map[string][]string) error {
+func readFile(path string, out map[string][]string) (err error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
+	// Release the file descriptor on every return path (success, parse error
+	// and scanner error). reload() and Reload() call readFile repeatedly for
+	// the whole lifetime of the process, so leaking the handle here would
+	// eventually exhaust the process file descriptor limit and break reloads.
+	defer func() {
+		if closeErr := f.Close(); closeErr != nil && err == nil {
+			err = closeErr
+		}
+	}()
 
 	scnr := bufio.NewScanner(f)
 	lineCounter := 0

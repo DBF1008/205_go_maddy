@@ -21,6 +21,7 @@ package table
 import (
 	"os"
 	"reflect"
+	"runtime"
 	"testing"
 	"time"
 
@@ -93,6 +94,61 @@ a: b`, map[string][]string{"a": {"b"}})
 a: b`, map[string][]string{"a": {"b"}})
 	test("# with whitespace too\n    \na: b", map[string][]string{"a": {"b"}})
 	test("a: b\na: c", map[string][]string{"a": {"b", "c"}})
+}
+
+func TestReadFile_NoLeak(t *testing.T) {
+	// readFile is the single read path shared by the initial Configure load,
+	// the periodic reloader and the forced Reload. It previously leaked the
+	// *os.File returned by os.Open on every call. Verify the descriptor is
+	// released by calling readFile many times and checking that the number of
+	// open file descriptors does not grow.
+	if runtime.GOOS != "linux" {
+		t.Skip("counting open file descriptors requires /proc, Linux only")
+	}
+
+	f, err := os.CreateTemp("", "maddy-tests-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func(name string) {
+		if err := os.Remove(name); err != nil {
+			t.Log(err)
+		}
+	}(f.Name())
+	if _, err := f.WriteString("cat: dog"); err != nil {
+		_ = f.Close()
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	openFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			t.Fatalf("cannot enumerate open file descriptors: %v", err)
+		}
+		return len(entries)
+	}
+
+	// Warm up once so any one-time allocations are not counted as a leak.
+	if err := readFile(f.Name(), map[string][]string{}); err != nil {
+		t.Fatal(err)
+	}
+
+	before := openFDs()
+	const iterations = 1000
+	for i := 0; i < iterations; i++ {
+		if err := readFile(f.Name(), map[string][]string{}); err != nil {
+			t.Fatalf("readFile failed on iteration %d: %v", i, err)
+		}
+	}
+	after := openFDs()
+
+	if after > before {
+		t.Fatalf("file descriptor leak: %d open descriptors before, %d after %d readFile calls",
+			before, after, iterations)
+	}
 }
 
 func TestFileReload(t *testing.T) {
