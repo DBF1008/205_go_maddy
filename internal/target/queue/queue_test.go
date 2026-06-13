@@ -552,7 +552,6 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	}
 
 	t.Run("NoMeta", func(t *testing.T) {
-		t.Skip("Not implemented")
 		test(t, ".meta")
 	})
 	t.Run("NoBody", func(t *testing.T) {
@@ -625,6 +624,93 @@ func TestQueueDelivery_AbortNoDangling(t *testing.T) {
 	}
 
 	checkQueueDir(t, q, []string{})
+}
+
+// failingBuffer is a buffer.Buffer test double used to simulate I/O failures
+// while a message body is being written to the queue spool.
+type failingBuffer struct {
+	openErr error
+	readErr error
+}
+
+func (b failingBuffer) Open() (io.ReadCloser, error) {
+	if b.openErr != nil {
+		return nil, b.openErr
+	}
+	return io.NopCloser(failingReader{b.readErr}), nil
+}
+
+func (failingBuffer) Len() int      { return 0 }
+func (failingBuffer) Remove() error { return nil }
+
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+// TestQueueDelivery_StoreNewMessageNoOrphan verifies that a failure at any point
+// during storeNewMessage rolls back every spool file, so a partially written
+// message never leaves orphan .header/.body/.meta files behind on disk.
+func TestQueueDelivery_StoreNewMessageNoOrphan(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		// setup runs before storeNewMessage. It may inject a failure into the
+		// spool directory and returns the body buffer to enqueue.
+		setup func(t *testing.T, q *Queue, id string) buffer.Buffer
+	}{
+		{
+			// body.Open fails after the .header file is created.
+			name: "BodyOpenFails",
+			setup: func(t *testing.T, q *Queue, id string) buffer.Buffer {
+				return failingBuffer{openErr: errors.New("simulated open error")}
+			},
+		},
+		{
+			// io.Copy fails after both .header and .body files are created.
+			name: "BodyCopyFails",
+			setup: func(t *testing.T, q *Queue, id string) buffer.Buffer {
+				return failingBuffer{readErr: errors.New("simulated read error")}
+			},
+		},
+		{
+			// os.Create for the body fails after the .header file is written:
+			// occupy the .body path with a directory so the create cannot
+			// succeed. This reproduces the orphaned-header bug directly.
+			name: "BodyCreateFails",
+			setup: func(t *testing.T, q *Queue, id string) buffer.Buffer {
+				if err := os.Mkdir(filepath.Join(q.location, id+".body"), 0o700); err != nil {
+					t.Fatal(err)
+				}
+				return buffer.MemoryBuffer{Slice: []byte("foobar\r\n")}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			q := newTestQueue(t, &unreliableTarget{})
+			defer cleanQueue(t, q)
+
+			id := "0123456789abcdef0123456789abcdef01234567"
+			meta := &QueueMetadata{
+				MsgMeta: &module.MsgMetadata{ID: id},
+				From:    "test@example.org",
+				To:      []string{"rcpt@example.org"},
+			}
+
+			body := tc.setup(t, q, id)
+
+			if _, err := q.storeNewMessage(meta, textproto.Header{}, body); err == nil {
+				t.Fatal("expected storeNewMessage to fail, got nil error")
+			}
+
+			// A failed enqueue must not leave any spool files behind.
+			checkQueueDir(t, q, []string{})
+		})
+	}
 }
 
 func TestQueueDSN(t *testing.T) {

@@ -681,16 +681,64 @@ func (q *Queue) readDiskQueue() error {
 		return err
 	}
 
-	// TODO(GH #209): Rewrite this function to pass all sub-tests in TestQueueDelivery_DeserializationCleanUp/NoMeta.
+	// A message is anchored by its meta-data file. Build the set of message IDs
+	// that have a .meta (live) or .meta_broken (kept for inspection) file first,
+	// so the main loop can recognize .header/.body files with no anchor as
+	// orphans left behind by an enqueue that was interrupted after writing them
+	// but before committing the meta-data. Such orphans are unrecoverable and
+	// must be removed, otherwise the spool directory leaks disk space forever.
+	anchoredIDs := make(map[string]struct{})
+	for _, entry := range dirInfo {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if id, ok := strings.CutSuffix(name, ".meta"); ok {
+			anchoredIDs[id] = struct{}{}
+		} else if id, ok := strings.CutSuffix(name, ".meta_broken"); ok {
+			anchoredIDs[id] = struct{}{}
+		}
+	}
 
 	loadedCount := 0
 	for _, entry := range dirInfo {
-		// We start loading from meta-data files and then check whether ID.header and ID.body exist.
-		// This allows us to properly detect dangling body files.
-		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".meta") {
+		if entry.IsDir() {
 			continue
 		}
-		id := entry.Name()[:len(entry.Name())-5]
+		name := entry.Name()
+
+		// A leftover .meta.new is a meta-data write that was interrupted before
+		// the atomic rename to .meta. It is never used for recovery, so it is
+		// always garbage on start-up.
+		if strings.HasSuffix(name, ".meta.new") {
+			q.tryRemoveDanglingFile(name)
+			continue
+		}
+
+		// Remove orphan header/body files that have no meta-data anchor and thus
+		// cannot be recovered. Files whose ID is anchored are handled by the
+		// per-meta logic below to keep dangling-file detection in one place.
+		if id, ok := strings.CutSuffix(name, ".header"); ok {
+			if _, anchored := anchoredIDs[id]; !anchored {
+				q.log.Printf("removing orphan header file without meta-data (msg ID = %s)", id)
+				q.tryRemoveDanglingFile(name)
+			}
+			continue
+		}
+		if id, ok := strings.CutSuffix(name, ".body"); ok {
+			if _, anchored := anchoredIDs[id]; !anchored {
+				q.log.Printf("removing orphan body file without meta-data (msg ID = %s)", id)
+				q.tryRemoveDanglingFile(name)
+			}
+			continue
+		}
+
+		// Everything else (notably .meta_broken files kept for inspection) is
+		// left untouched; only .meta files drive actual queue entry loading.
+		if !strings.HasSuffix(name, ".meta") {
+			continue
+		}
+		id := name[:len(name)-len(".meta")]
 
 		meta, err := q.readMessageMeta(id)
 		if err != nil {
@@ -755,6 +803,19 @@ func (q *Queue) readDiskQueue() error {
 func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, body buffer.Buffer) (buffer.Buffer, error) {
 	id := meta.MsgMeta.ID
 
+	// Enqueue is not atomic: we write .header, then .body, then .meta and fsync
+	// everything. If any step fails (disk full, permission error, crash, fsync
+	// error) whatever was already written must be removed, otherwise the spool
+	// directory accumulates orphan files that readDiskQueue cannot recover and
+	// that are never cleaned up. The deferred rollback below keeps the on-disk
+	// state all-or-nothing: either every file is present and fsync'd, or none.
+	success := false
+	defer func() {
+		if !success {
+			q.cleanupPartialMessage(id)
+		}
+	}()
+
 	headerPath := filepath.Join(q.location, id+".header")
 	headerFile, err := os.Create(headerPath)
 	if err != nil {
@@ -767,13 +828,11 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 	}()
 
 	if err := textproto.WriteHeader(headerFile, header); err != nil {
-		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 
 	bodyReader, err := body.Open()
 	if err != nil {
-		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 	defer func() {
@@ -794,14 +853,10 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 	}()
 
 	if _, err := io.Copy(bodyFile, bodyReader); err != nil {
-		q.tryRemoveDanglingFile(id + ".body")
-		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 
 	if err := q.updateMetadataOnDisk(meta); err != nil {
-		q.tryRemoveDanglingFile(id + ".body")
-		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 
@@ -813,6 +868,9 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 		return nil, err
 	}
 
+	// Past this point the message is durably stored, so the rollback above must
+	// not fire and the queue length gauge can be incremented.
+	success = true
 	queuedMsgs.WithLabelValues(q.name, q.location).Inc()
 
 	return buffer.FileBuffer{Path: bodyPath, LenHint: body.Len()}, nil
@@ -900,6 +958,29 @@ func (q *Queue) tryRemoveDanglingFile(name string) {
 		return
 	}
 	q.log.Printf("removed dangling file %s", name)
+}
+
+// removeMessageFile removes a single spool file for a queued message, ignoring
+// the case where the file does not exist. Unlike tryRemoveDanglingFile it stays
+// silent for already-absent files, which makes it suitable for best-effort
+// rollback of a partially written message where only some of the files may have
+// been created yet.
+func (q *Queue) removeMessageFile(name string) {
+	if err := os.Remove(filepath.Join(q.location, name)); err != nil && !os.IsNotExist(err) {
+		q.log.Error("failed to remove message file", err, "file", name)
+	}
+}
+
+// cleanupPartialMessage removes every spool file that may have been created for
+// the message with the given ID: the .header, .body and .meta files as well as
+// the transient .meta.new file written by updateMetadataOnDisk. It is used to
+// roll back a failed enqueue so an interrupted write never leaves orphan files
+// behind on disk.
+func (q *Queue) cleanupPartialMessage(id string) {
+	q.removeMessageFile(id + ".header")
+	q.removeMessageFile(id + ".body")
+	q.removeMessageFile(id + ".meta")
+	q.removeMessageFile(id + ".meta.new")
 }
 
 func (q *Queue) openMessage(id string) (*QueueMetadata, textproto.Header, buffer.Buffer, error) {
