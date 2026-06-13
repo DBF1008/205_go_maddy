@@ -74,6 +74,30 @@ func (ctx *parseContext) expandImports(node Node, expansionDepth int) (Node, err
 	return node, nil
 }
 
+// openImportFile tries to open the import file at the given path. If the file
+// is not found, it falls back to trying path + ".conf". Returns the opened
+// file and the resolved path used to open it. The caller is responsible for
+// closing the returned file.
+func openImportFile(path string) (*os.File, string, error) {
+	f, err := os.Open(path)
+	if err == nil {
+		return f, path, nil
+	}
+	if !os.IsNotExist(err) {
+		return nil, "", err
+	}
+	// Fallback: try appending .conf extension.
+	confPath := path + ".conf"
+	f, err = os.Open(confPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, "", os.ErrNotExist
+		}
+		return nil, "", err
+	}
+	return f, confPath, nil
+}
+
 func (ctx *parseContext) resolveImport(node Node, name string, expansionDepth int) ([]Node, error) {
 	if subtree, ok := ctx.snippets[name]; ok {
 		return subtree, nil
@@ -83,21 +107,16 @@ func (ctx *parseContext) resolveImport(node Node, name string, expansionDepth in
 	if !filepath.IsAbs(name) {
 		file = filepath.Join(filepath.Dir(ctx.fileLocation), name)
 	}
-	src, err := os.Open(file)
+	src, openedPath, err := openImportFile(file)
 	if err != nil {
 		if os.IsNotExist(err) {
-			src, err = os.Open(file + ".conf")
-			if err != nil {
-				if os.IsNotExist(err) {
-					return nil, NodeErr(node, "unknown import: %s", name)
-				}
-				return nil, err
-			}
-		} else {
-			return nil, err
+			return nil, NodeErr(node, "unknown import: %s", name)
 		}
+		return nil, err
 	}
-	nodes, snips, macros, err := readTree(src, file, expansionDepth+1)
+	defer src.Close()
+
+	nodes, snips, macros, err := readTree(src, openedPath, expansionDepth+1)
 	if err != nil {
 		return nodes, err
 	}

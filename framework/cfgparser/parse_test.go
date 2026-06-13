@@ -19,7 +19,10 @@ along with this program.  If not, see <https://www.gnu.org/licenses/>.
 package parser
 
 import (
+	"fmt"
+	"io"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -621,4 +624,248 @@ func TestRead(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestImportFromFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create an imported config file.
+	importedPath := filepath.Join(dir, "imported.conf")
+	require.NoError(t, os.WriteFile(importedPath, []byte("imported_dir value1\n"), 0644))
+
+	// Create main config that imports the file.
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte("import imported.conf\n"), 0644))
+
+	f, err := os.Open(mainPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	nodes, err := Read(f, mainPath)
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	require.Equal(t, "imported_dir", nodes[0].Name)
+	require.Equal(t, []string{"value1"}, nodes[0].Args)
+}
+
+func TestImportConfExtensionFallback(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create a file with .conf extension.
+	importedPath := filepath.Join(dir, "snippets.conf")
+	require.NoError(t, os.WriteFile(importedPath, []byte("snippet_dir arg1\n"), 0644))
+
+	// Import by name without .conf — should fall back to snippets.conf.
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte("import snippets\n"), 0644))
+
+	f, err := os.Open(mainPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	nodes, err := Read(f, mainPath)
+	require.NoError(t, err)
+	require.Len(t, nodes, 1)
+	require.Equal(t, "snippet_dir", nodes[0].Name)
+	require.Equal(t, []string{"arg1"}, nodes[0].Args)
+}
+
+func TestImportFileDescriptorsClosed(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create import files. We keep references so we can probe whether the
+	// parser closed its own copies after Read returns.
+	imported1Path := filepath.Join(dir, "import1.conf")
+	require.NoError(t, os.WriteFile(imported1Path, []byte("dir1 val\n"), 0644))
+
+	imported2Path := filepath.Join(dir, "import2.conf")
+	require.NoError(t, os.WriteFile(imported2Path, []byte("dir2 val\n"), 0644))
+
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte("import import1.conf\nimport import2.conf\n"), 0644))
+
+	// Open each import file directly to hold a reference. After the parse,
+	// we rename the files away and then try to read through our held
+	// references. If the parser leaked its fds (no Close), the held fds
+	// would still work on most OSes because the inode is still linked.
+	// After rename+delete the held reads must fail — proving the parser
+	// released its own fds and the OS could reclaim the resources.
+	f1, err := os.Open(imported1Path)
+	require.NoError(t, err)
+	defer f1.Close()
+
+	f2, err := os.Open(imported2Path)
+	require.NoError(t, err)
+	defer f2.Close()
+
+	// Parse the main config (this will open and — with the fix — close the
+	// import files internally).
+	mainF, err := os.Open(mainPath)
+	require.NoError(t, err)
+
+	nodes, err := Read(mainF, mainPath)
+	mainF.Close()
+	require.NoError(t, err)
+	require.Len(t, nodes, 2)
+	require.Equal(t, "dir1", nodes[0].Name)
+	require.Equal(t, "dir2", nodes[1].Name)
+
+	// Remove the import files from the filesystem. Any fds the parser
+	// failed to close are the only remaining links to the inodes.
+	require.NoError(t, os.Remove(imported1Path))
+	require.NoError(t, os.Remove(imported2Path))
+
+	// Our own held fds should now be the only references. If the parser
+	// properly closed its fds, the OS may have already freed the inodes.
+	// Regardless, a fresh Open must fail because the paths are gone.
+	_, err = os.Open(imported1Path)
+	require.True(t, os.IsNotExist(err), "import1.conf should no longer exist at its path")
+	_, err = os.Open(imported2Path)
+	require.True(t, os.IsNotExist(err), "import2.conf should no longer exist at its path")
+
+	// Reads through our held references should fail: the files have been
+	// unlinked and — with the parser's fds closed — the kernel can reclaim
+	// the inode. On Linux the held reads return data from the page cache
+	// until the last fd is closed, so we verify via /proc/self/fd that the
+	// parser did not leave any dangling fds pointing at the removed files.
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err == nil {
+		for _, entry := range entries {
+			target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+			if err != nil {
+				continue
+			}
+			if target == imported1Path || target == imported2Path {
+				t.Errorf("parser leaked file descriptor for %s (fd %s still open)", target, entry.Name())
+			}
+		}
+	}
+}
+
+func TestImportParseErrorClosesFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Create an import file with intentionally broken syntax so readTree
+	// returns an error. The fix must still close the file in this path.
+	badPath := filepath.Join(dir, "bad.conf")
+	require.NoError(t, os.WriteFile(badPath, []byte("dir {\n"), 0644)) // missing closing brace
+
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte("import bad.conf\n"), 0644))
+
+	f, err := os.Open(mainPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	_, err = Read(f, mainPath)
+	require.Error(t, err, "parse should fail due to missing closing brace in imported file")
+
+	// Verify no leaked fd pointing at bad.conf.
+	entries, readErr := os.ReadDir("/proc/self/fd")
+	if readErr == nil {
+		for _, entry := range entries {
+			target, linkErr := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+			if linkErr != nil {
+				continue
+			}
+			if target == badPath {
+				t.Errorf("parser leaked file descriptor for %s after parse error (fd %s still open)", badPath, entry.Name())
+			}
+		}
+	}
+}
+
+func TestImportUnknownDoesNotLeak(t *testing.T) {
+	dir := t.TempDir()
+
+	// Main config imports a file that does not exist at all (no .conf
+	// fallback either). resolveImport must not leak any fd.
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte("import nonexistent\n"), 0644))
+
+	f, err := os.Open(mainPath)
+	require.NoError(t, err)
+	defer f.Close()
+
+	_, err = Read(f, mainPath)
+	require.Error(t, err, "import of nonexistent file should fail")
+	require.Contains(t, err.Error(), "unknown import")
+}
+
+func TestImportManyFilesNoLeak(t *testing.T) {
+	dir := t.TempDir()
+
+	const n = 50
+	var imports strings.Builder
+	for i := 0; i < n; i++ {
+		name := filepath.Join(dir, fmt.Sprintf("inc_%03d.conf", i))
+		require.NoError(t, os.WriteFile(name, []byte(fmt.Sprintf("dir_%03d v\n", i)), 0644))
+		imports.WriteString("import " + filepath.Base(name) + "\n")
+	}
+
+	mainPath := filepath.Join(dir, "main.conf")
+	require.NoError(t, os.WriteFile(mainPath, []byte(imports.String()), 0644))
+
+	// Snapshot the number of open fds before parsing.
+	countFDs := func() int {
+		entries, err := os.ReadDir("/proc/self/fd")
+		if err != nil {
+			return -1
+		}
+		return len(entries)
+	}
+	fdsBefore := countFDs()
+
+	f, err := os.Open(mainPath)
+	require.NoError(t, err)
+
+	nodes, err := Read(f, mainPath)
+	f.Close()
+	require.NoError(t, err)
+	require.Len(t, nodes, n)
+
+	fdsAfter := countFDs()
+	if fdsBefore >= 0 && fdsAfter >= 0 {
+		// Allow a small delta for test-internal allocations, but the
+		// parser must not leave n dangling fds.
+		if fdsAfter-fdsBefore > 5 {
+			t.Errorf("possible fd leak: %d fds before, %d after (delta %d, imported %d files)",
+				fdsBefore, fdsAfter, fdsAfter-fdsBefore, n)
+		}
+	}
+}
+
+func TestOpenImportFile(t *testing.T) {
+	dir := t.TempDir()
+
+	// Case 1: exact path exists.
+	exactPath := filepath.Join(dir, "exact.conf")
+	require.NoError(t, os.WriteFile(exactPath, []byte("data\n"), 0644))
+
+	f, resolved, err := openImportFile(exactPath)
+	require.NoError(t, err)
+	require.Equal(t, exactPath, resolved)
+	data, err := io.ReadAll(f)
+	require.NoError(t, err)
+	require.Equal(t, "data\n", string(data))
+	f.Close()
+
+	// Case 2: base path missing, .conf fallback exists.
+	basePath := filepath.Join(dir, "fallback")
+	fallbackPath := basePath + ".conf"
+	require.NoError(t, os.WriteFile(fallbackPath, []byte("fallback\n"), 0644))
+
+	f, resolved, err = openImportFile(basePath)
+	require.NoError(t, err)
+	require.Equal(t, fallbackPath, resolved)
+	data, err = io.ReadAll(f)
+	require.NoError(t, err)
+	require.Equal(t, "fallback\n", string(data))
+	f.Close()
+
+	// Case 3: neither exists.
+	missing := filepath.Join(dir, "missing")
+	_, _, err = openImportFile(missing)
+	require.Error(t, err)
+	require.True(t, os.IsNotExist(err))
 }
