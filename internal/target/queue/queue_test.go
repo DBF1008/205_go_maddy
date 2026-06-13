@@ -552,7 +552,6 @@ func TestQueueDelivery_DeserlizationCleanUp(t *testing.T) {
 	}
 
 	t.Run("NoMeta", func(t *testing.T) {
-		t.Skip("Not implemented")
 		test(t, ".meta")
 	})
 	t.Run("NoBody", func(t *testing.T) {
@@ -823,6 +822,111 @@ func TestQueueDSN_RcptRewrite(t *testing.T) {
 	if !bytes.Contains(msg.Body, []byte("test+public@example.com")) || !bytes.Contains(msg.Body, []byte("test2+public@example.com")) {
 		t.Errorf("DSN contents do not mention original addresses")
 	}
+}
+
+// failBuffer is a buffer.Buffer whose Open() always returns an error.
+// Used to test storeNewMessage cleanup when body reading fails.
+type failBuffer struct{}
+
+func (failBuffer) Open() (io.ReadCloser, error) {
+	return nil, errors.New("failBuffer: simulated open failure")
+}
+
+func (failBuffer) Len() int { return 0 }
+
+func (failBuffer) Remove() error { return nil }
+
+// TestStoreNewMessage_CleanupOnBodyOpenFailure verifies that storeNewMessage
+// removes the .header file when body.Open() fails, leaving no orphans.
+func TestStoreNewMessage_CleanupOnBodyOpenFailure(t *testing.T) {
+	t.Parallel()
+
+	dt := unreliableTarget{committed: make(chan testutils.Msg, 10)}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	meta := &QueueMetadata{
+		MsgMeta:    &module.MsgMetadata{ID: "test-bodyopen-cleanup"},
+		From:       "tester@example.com",
+		To:         []string{"tester1@example.org"},
+		TriesCount: map[string]int{"tester1@example.org": 1},
+	}
+
+	_, err := q.storeNewMessage(meta, textproto.Header{}, failBuffer{})
+	if err == nil {
+		t.Fatal("expected storeNewMessage to fail with failBuffer")
+	}
+
+	checkQueueDir(t, q, []string{})
+}
+
+// TestQueueDelivery_DeserializationCleanUp_CorruptedMeta verifies that a
+// corrupted (unreadable) .meta file triggers cleanup of all three queue
+// files (.meta, .header, .body) during readDiskQueue.
+func TestQueueDelivery_DeserializationCleanUp_CorruptedMeta(t *testing.T) {
+	t.Parallel()
+
+	dt := unreliableTarget{
+		rcptFailures: []map[string]error{
+			{
+				"tester1@example.org": exterrors.WithTemporary(errors.New("go away"), true),
+			},
+		},
+		committed: make(chan testutils.Msg, 10),
+	}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	q.initialRetryTime = 1 * time.Second
+	q.postInitDelay = 0
+
+	deliveryID := testutils.DoTestDelivery(t, q, "tester@example.com", []string{"tester1@example.org", "tester2@example.org"})
+
+	// Wait for partial delivery so the message is persisted on disk.
+	msg := readMsgChanTimeout(t, dt.committed, 5*time.Second)
+	testutils.CheckMsgID(t, msg, "tester@example.com", []string{"tester2@example.org"}, "")
+
+	require.NoError(t, q.Stop())
+
+	// Corrupt the .meta file so it becomes unreadable.
+	if err := os.WriteFile(filepath.Join(q.location, deliveryID+".meta"), []byte("not valid json!!!"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Restart queue — readDiskQueue should detect the corrupted meta and
+	// remove all three files.
+	q = newTestQueueDir(t, &dt, q.location)
+	require.NoError(t, q.Stop())
+
+	checkQueueDir(t, q, []string{})
+}
+
+// TestQueueDelivery_OrphanFilesCleanedOnRestart verifies that orphaned
+// .header and .body files (without any .meta) are cleaned up when the
+// queue restarts, even when they were not created by the normal
+// storeNewMessage path.
+func TestQueueDelivery_OrphanFilesCleanedOnRestart(t *testing.T) {
+	t.Parallel()
+
+	dt := unreliableTarget{committed: make(chan testutils.Msg, 10)}
+	q := newTestQueue(t, &dt)
+	defer cleanQueue(t, q)
+
+	// Simulate orphaned files left behind by a crashed storeNewMessage.
+	orphanID := "orphan-test-msg"
+	for _, suffix := range []string{".header", ".body"} {
+		if err := os.WriteFile(filepath.Join(q.location, orphanID+suffix), []byte("orphan data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	require.NoError(t, q.Stop())
+
+	// Restart queue — readDiskQueue second pass should clean up orphans.
+	q = newTestQueueDir(t, &dt, q.location)
+	require.NoError(t, q.Stop())
+
+	checkQueueDir(t, q, []string{})
 }
 
 func init() {

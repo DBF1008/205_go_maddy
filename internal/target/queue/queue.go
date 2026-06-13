@@ -681,8 +681,6 @@ func (q *Queue) readDiskQueue() error {
 		return err
 	}
 
-	// TODO(GH #209): Rewrite this function to pass all sub-tests in TestQueueDelivery_DeserializationCleanUp/NoMeta.
-
 	loadedCount := 0
 	for _, entry := range dirInfo {
 		// We start loading from meta-data files and then check whether ID.header and ID.body exist.
@@ -694,7 +692,11 @@ func (q *Queue) readDiskQueue() error {
 
 		meta, err := q.readMessageMeta(id)
 		if err != nil {
-			q.log.Printf("failed to read meta-data, skipping: %v (msg ID = %s)", err, id)
+			q.log.Printf("failed to read meta-data: %v (msg ID = %s)", err, id)
+			q.log.Printf("removing message with unreadable meta-data (msg ID = %s)", id)
+			q.tryRemoveDanglingFile(id + ".meta")
+			q.tryRemoveDanglingFile(id + ".header")
+			q.tryRemoveDanglingFile(id + ".body")
 			continue
 		}
 
@@ -745,6 +747,30 @@ func (q *Queue) readDiskQueue() error {
 		queuedMsgs.WithLabelValues(q.name, q.location).Inc()
 	}
 
+	// Second pass: clean up orphaned .header and .body files that have no
+	// corresponding .meta file. These can be left behind if storeNewMessage
+	// fails partway through (e.g. disk full, crash) and the meta file was
+	// never written or was corrupted.
+	for _, entry := range dirInfo {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		var orphanID string
+		if strings.HasSuffix(name, ".header") {
+			orphanID = strings.TrimSuffix(name, ".header")
+		} else if strings.HasSuffix(name, ".body") {
+			orphanID = strings.TrimSuffix(name, ".body")
+		} else {
+			continue
+		}
+
+		if _, err := os.Stat(filepath.Join(q.location, orphanID+".meta")); os.IsNotExist(err) {
+			q.log.Printf("found orphaned queue file without .meta: %s", name)
+			q.tryRemoveDanglingFile(name)
+		}
+	}
+
 	if loadedCount != 0 {
 		q.log.Printf("loaded %d saved queue entries", loadedCount)
 	}
@@ -785,6 +811,7 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 	bodyPath := filepath.Join(q.location, id+".body")
 	bodyFile, err := os.Create(bodyPath)
 	if err != nil {
+		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 	defer func() {
@@ -806,10 +833,16 @@ func (q *Queue) storeNewMessage(meta *QueueMetadata, header textproto.Header, bo
 	}
 
 	if err := headerFile.Sync(); err != nil {
+		q.tryRemoveDanglingFile(id + ".meta")
+		q.tryRemoveDanglingFile(id + ".body")
+		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 
 	if err := bodyFile.Sync(); err != nil {
+		q.tryRemoveDanglingFile(id + ".meta")
+		q.tryRemoveDanglingFile(id + ".body")
+		q.tryRemoveDanglingFile(id + ".header")
 		return nil, err
 	}
 
